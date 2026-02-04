@@ -14,10 +14,19 @@ infura_base_url = 'https://mainnet.infura.io/v3/'
 #Oracle params
 redstone_multifeed_adapter = '0xd72a6ba4a87ddb33e801b3f1c7750b2d0911fc6c'
 
-vbill_id = '0x5642494c4c5f455448455245554d5f46554e44414d454e54414c000000000000' #VBILL
-stac_id = '0x535441435f46554e44414d454e54414c00000000000000000000000000000000' #STAC
-acred_id = '0x41435245445f46554e44414d454e54414c000000000000000000000000000000' #ACRED
-hlscope_id = '0x484c53636f70655f46554e44414d454e54414c00000000000000000000000000' #HLSCOPE
+# Define all oracle IDs and their corresponding feed names
+ORACLE_IDS = {
+    '0x5642494c4c5f455448455245554d5f46554e44414d454e54414c000000000000': 'VBILL',
+    '0x535441435f46554e44414d454e54414c00000000000000000000000000000000': 'STAC',
+    '0x41435245445f46554e44414d454e54414c000000000000000000000000000000': 'ACRED',
+    '0x484c53636f70655f46554e44414d454e54414c00000000000000000000000000': 'HLSCOPE'
+}
+
+# Create a set of oracle_id hex strings (lowercase) for fast lookup
+oracle_id_hex_set = {oracle_id[2:].lower() for oracle_id in ORACLE_IDS.keys()}
+
+# Create a reverse lookup: hex string (no 0x) -> feed name
+oracle_id_to_feed = {oracle_id[2:].lower(): feed for oracle_id, feed in ORACLE_IDS.items()}
 
 
 # Connect to Infura
@@ -74,11 +83,8 @@ CONTRACT_ABI = [
 # Create contract instance
 contract = w3.eth.contract(address=Web3.to_checksum_address(redstone_multifeed_adapter), abi=CONTRACT_ABI)
 
-# Convert oracle_id to bytes32 format for filtering
-oracle_id_bytes = bytes.fromhex(oracle_id[2:])  # Remove '0x' prefix
-
 # Get all ValueUpdate events (dataFeedId is not indexed, so we filter after fetching)
-print(f"\nFetching ValueUpdate events for dataFeedId: {oracle_id}")
+print(f"\nFetching ValueUpdate events for feeds: {', '.join(ORACLE_IDS.values())}")
 print("This may take a while if querying from genesis block...")
 
 # Get events - query from a reasonable starting point (e.g., last 100k blocks)
@@ -103,8 +109,6 @@ try:
     current_from = from_block
     total_logs = 0
     
-    oracle_id_hex = oracle_id[2:].lower()  # Remove '0x' and lowercase for comparison
-    
     print("Querying in batches to avoid result limit...")
     
     while current_from <= latest_block:
@@ -122,7 +126,7 @@ try:
             total_logs += len(logs)
             print(f"  Blocks {current_from}-{current_to}: Found {len(logs)} ValueUpdate events")
             
-            # Decode and filter events where dataFeedId matches oracle_id
+            # Decode and filter events where dataFeedId matches any of our oracle IDs
             for log in logs:
                 try:
                     # Decode the log using the contract event
@@ -137,9 +141,20 @@ try:
                     else:
                         event_id_hex = str(event_data_feed_id).lower()
                     
-                    # Compare hex strings (normalized to lowercase)
-                    if event_id_hex == oracle_id_hex:
-                        nav_updates.append(decoded_event)
+                    # Remove '0x' prefix if present for comparison
+                    if event_id_hex.startswith('0x'):
+                        event_id_hex = event_id_hex[2:]
+                    
+                    # Check if this event matches any of our oracle IDs
+                    if event_id_hex in oracle_id_hex_set:
+                        # Get the feed name for this oracle ID
+                        feed_name = oracle_id_to_feed.get(event_id_hex)
+                        
+                        # Store the event with feed name
+                        nav_updates.append({
+                            'event': decoded_event,
+                            'feed': feed_name
+                        })
                 except Exception as decode_error:
                     # Skip logs that can't be decoded (shouldn't happen, but just in case)
                     continue
@@ -162,7 +177,7 @@ try:
                 continue
     
     print(f"\nTotal: Found {total_logs} ValueUpdate event logs across all batches")
-    print(f"Found {len(nav_updates)} NAV updates matching oracle_id: {oracle_id}")
+    print(f"Found {len(nav_updates)} NAV updates matching any of the oracle IDs")
     
 except Exception as e:
     print(f"Error querying ValueUpdate events: {e}")
@@ -171,14 +186,21 @@ except Exception as e:
 
 # Sort by block number (oldest first)
 if nav_updates:
-    nav_updates.sort(key=lambda x: x.blockNumber)
+    nav_updates.sort(key=lambda x: x['event'].blockNumber)
     
-    print(f"\n{'='*80}")
-    print(f"NAV UPDATES FOR ORACLE ID: {oracle_id}")
-    print(f"{'='*80}\n")
+    print(f"\n{'='*100}")
+    print(f"NAV UPDATES FOR ALL FEEDS")
+    print(f"{'='*100}\n")
     
-    # Display NAV updates
-    for i, event in enumerate(nav_updates, 1):
+    # Print header
+    print(f"{'Block Timestamp':<25} {'Hash':<70} {'NAV Value':<20} {'Feed':<10}")
+    print(f"{'-'*25} {'-'*70} {'-'*20} {'-'*10}")
+    
+    # Display NAV updates in the requested format
+    for update in nav_updates:
+        event = update['event']
+        feed = update['feed']
+        
         # Get block timestamp
         try:
             block = w3.eth.get_block(event.blockNumber)
@@ -188,17 +210,12 @@ if nav_updates:
         except:
             timestamp_str = "N/A"
         
-        print(f"Update #{i}")
-        print(f"  Block Number: {event.blockNumber}")
-        print(f"  Block Timestamp: {timestamp_str}")
-        print(f"  Transaction Hash: {event.transactionHash.hex()}")
-        print(f"  Event: {event.event}")
-        print(f"  NAV Value: {event.args.value:,}")
-        print(f"  Data Feed ID: {event.args.dataFeedId.hex()}")
-        print(f"  Updated At (from event): {event.args.updatedAt}")
-        print(f"  Log Index: {event.logIndex}")
-        print()
+        # Format output: Block timestamp, Hash, NAV Value, Feed
+        hash_str = event.transactionHash.hex()
+        nav_value = f"{event.args.value:,}"
+        
+        print(f"{timestamp_str:<25} {hash_str:<70} {nav_value:<20} {feed:<10}")
 else:
-    print(f"\nNo NAV updates found for oracle_id: {oracle_id}")
+    print(f"\nNo NAV updates found for any of the oracle IDs")
     print("You may need to adjust the from_block range or check if the contract has emitted events.")
 
