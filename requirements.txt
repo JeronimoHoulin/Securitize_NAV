@@ -1,2 +1,4 @@
 python-dotenv
 web3
+pandas
+openpyxl
