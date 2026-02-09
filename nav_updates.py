@@ -1,333 +1,667 @@
-
 import os
 import sys
-from datetime import datetime, date
-from collections import defaultdict
+import time
+from datetime import datetime
+
+import pandas as pd
 from dotenv import load_dotenv
 from web3 import Web3
-import pandas as pd
 
-# Load environment variables from .env file
+# =============================
+# Configuration
+# =============================
+
 load_dotenv()
 
-# Get API credentials from environment variables
-api_key = os.getenv('api_key')
-infura_base_url = 'https://mainnet.infura.io/v3/'
+INFURA_API_KEY = os.getenv("INFURA_API_KEY") or os.getenv("api_key")
+ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY")
 
-#Oracle params
-redstone_multifeed_adapter = '0xd72a6ba4a87ddb33e801b3f1c7750b2d0911fc6c'
+if not INFURA_API_KEY:
+    raise Exception("Missing INFURA_API_KEY in .env (or legacy api_key)")
 
-# Define all oracle IDs and their corresponding feed names
+# remove this entirely for now:
+# if not ALCHEMY_API_KEY:
+#if not ALCHEMY_API_KEY:
+#    raise Exception("Missing ALCHEMY_API_KEY in .env")
+
+RPCS = [
+    f"https://mainnet.infura.io/v3/{INFURA_API_KEY}",
+    # f"https://eth-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}", - removed since free plan is very restrictive
+    "https://eth.llamarpc.com",
+]
+
+REDSTONE_MULTIFEED_ADAPTER = "0xd72a6ba4a87ddb33e801b3f1c7750b2d0911fc6c"
+
 ORACLE_IDS = {
-    '0x535441435f46554e44414d454e54414c00000000000000000000000000000000': 'STAC',
-    '0x41435245445f46554e44414d454e54414c000000000000000000000000000000': 'ACRED',
-    '0x484c53636f70655f46554e44414d454e54414c00000000000000000000000000': 'HLSCOPE'
+    "0x535441435f46554e44414d454e54414c00000000000000000000000000000000": "STAC",
+    "0x41435245445f46554e44414d454e54414c000000000000000000000000000000": "ACRED",
+    "0x484c53636f70655f46554e44414d454e54414c00000000000000000000000000": "HLSCOPE",
 }
 
-# Create a set of oracle_id hex strings (lowercase) for fast lookup
-oracle_id_hex_set = {oracle_id[2:].lower() for oracle_id in ORACLE_IDS.keys()}
+ORACLE_ID_HEX_SET = {oid[2:].lower() for oid in ORACLE_IDS.keys()}
+ORACLE_ID_TO_FEED = {oid[2:].lower(): name for oid, name in ORACLE_IDS.items()}
 
-# Create a reverse lookup: hex string (no 0x) -> feed name
-oracle_id_to_feed = {oracle_id[2:].lower(): feed for oracle_id, feed in ORACLE_IDS.items()}
-
-# Configuration
-# NAV values are stored with 8 decimal places (common for financial values)
 NAV_DECIMALS = 8
-TEST_MODE = '--test' in sys.argv
-TEST_SAMPLE_SIZE = 10  # Number of samples per vault for test mode
-
-# Redstone multifeed adapter was created at block 20419584
-# We only query from this block onwards since NAV updates only exist after the adapter was deployed
 REDSTONE_ADAPTER_CREATION_BLOCK = 20419584
 
+DEFAULT_BATCH_SIZE = 2000
+MIN_BATCH_SIZE = 250
+LLAMA_MAX_BLOCK_RANGE = 1000  # llamaRPC eth_getLogs hard range cap
 
-# Connect to Infura
-infura_url = f"{infura_base_url}{api_key}"
-w3 = Web3(Web3.HTTPProvider(infura_url))
+TEST_MODE = "--test" in sys.argv
+TEST_SAMPLE_SIZE = 10
 
-# Verify connection
-if not w3.is_connected():
-    raise Exception("Failed to connect to Infura")
+ALLOW_SKIP = "--allow-skip" in sys.argv ##optional skip when you explicitly want speed over precision
 
-print(f"Connected to Ethereum mainnet via Infura")
-print(f"Latest block: {w3.eth.block_number}")
 
-# Contract ABI for Redstone multifeed adapter implementation
-# Using the implementation ABI since it's a proxy contract
-# The ValueUpdate event has dataFeedId as non-indexed, so we'll filter after fetching
+INCREMENTAL_MODE = "--incremental" in sys.argv
+LAST_BLOCK_FILE = "last_processed_block.txt"
+
+OUTPUT_FILENAME = "nav_volatility_analysis_test.xlsx" if TEST_MODE else "nav_volatility_analysis.xlsx"
+
 CONTRACT_ABI = [
     {
         "anonymous": False,
         "inputs": [
             {"indexed": False, "internalType": "uint256", "name": "value", "type": "uint256"},
             {"indexed": False, "internalType": "bytes32", "name": "dataFeedId", "type": "bytes32"},
-            {"indexed": False, "internalType": "uint256", "name": "updatedAt", "type": "uint256"}
+            {"indexed": False, "internalType": "uint256", "name": "updatedAt", "type": "uint256"},
         ],
         "name": "ValueUpdate",
-        "type": "event"
-    },
-    {
-        "anonymous": False,
-        "inputs": [
-            {"indexed": False, "internalType": "bytes32", "name": "dataFeedId", "type": "bytes32"}
-        ],
-        "name": "UpdateSkipDueToBlockTimestamp",
-        "type": "event"
-    },
-    {
-        "anonymous": False,
-        "inputs": [
-            {"indexed": False, "internalType": "bytes32", "name": "dataFeedId", "type": "bytes32"}
-        ],
-        "name": "UpdateSkipDueToDataTimestamp",
-        "type": "event"
-    },
-    {
-        "anonymous": False,
-        "inputs": [
-            {"indexed": False, "internalType": "bytes32", "name": "dataFeedId", "type": "bytes32"}
-        ],
-        "name": "UpdateSkipDueToInvalidValue",
-        "type": "event"
+        "type": "event",
     }
 ]
 
-# Create contract instance
-contract = w3.eth.contract(address=Web3.to_checksum_address(redstone_multifeed_adapter), abi=CONTRACT_ABI)
+EVENT_SIG_HASH = Web3.keccak(text="ValueUpdate(uint256,bytes32,uint256)")
 
-# Get all ValueUpdate events (dataFeedId is not indexed, so we filter after fetching)
-print(f"\nFetching ValueUpdate events for feeds: {', '.join(ORACLE_IDS.values())}")
-print(f"Querying from block {REDSTONE_ADAPTER_CREATION_BLOCK} (Redstone multifeed adapter creation)...")
+# =============================
+# RPC management
+# =============================
 
-# Get events - query from block 20419584 (when Redstone multifeed adapter was created)
-# NAV updates only exist after the adapter was deployed
+_current_rpc_idx = 0
+w3 = None
+
+# rotate cooldown to avoid rapid RPC ping-pong
+_last_rotate_ts = 0.0
+ROTATE_COOLDOWN_SEC = 10
+
+def connect_web3() -> Web3:
+    global w3
+    rpc = RPCS[_current_rpc_idx]
+    candidate = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 30}))
+    if not candidate.is_connected():
+        raise Exception(f"Failed to connect to RPC: {rpc}")
+    w3 = candidate
+    return w3
+
+
+def rotate_rpc(reason: str = "") -> None:
+    """
+    Rotate to the next *reachable* RPC.
+    Tries all RPCs once before failing.
+    """
+    global _current_rpc_idx, _last_rotate_ts, w3
+    now = time.time()
+
+    if now - _last_rotate_ts < ROTATE_COOLDOWN_SEC:
+        return
+
+    start_idx = _current_rpc_idx
+    for step in range(1, len(RPCS) + 1):
+        idx = (start_idx + step) % len(RPCS)
+        rpc = RPCS[idx]
+        candidate = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 30}))
+        if candidate.is_connected():
+            _current_rpc_idx = idx
+            w3 = candidate
+            _last_rotate_ts = now
+            msg = f"Switching RPC to {rpc}"
+            if reason:
+                msg += f" ({reason})"
+            print(f"  {msg}")
+            return
+
+    raise Exception("No reachable RPC endpoint available")
+
+
+
+
+def current_rpc() -> str:
+    return RPCS[_current_rpc_idx]
+
+
+def current_rpc_is_llama() -> bool:
+    return "llamarpc" in current_rpc().lower()
+
+
+def effective_batch_size(base_batch_size: int) -> int:
+    if current_rpc_is_llama():
+        return min(base_batch_size, LLAMA_MAX_BLOCK_RANGE)
+    return base_batch_size
+
+
+# =============================
+# Helpers
+# =============================
+
+def is_rate_limit_error(msg: str) -> bool:
+    s = msg.lower()
+    return "429" in s or "too many requests" in s or "rate limit" in s
+
+
+def is_range_too_large_error(msg: str) -> bool:
+    s = msg.lower()
+    return (
+        "range is too large" in s
+        or "max is 1k blocks" in s
+        or "more than 10000 results" in s
+        or "10000" in s
+    )
+
+
+def is_transient_error(msg: str) -> bool:
+    s = msg.lower()
+    transient_terms = [
+        "429",
+        "too many requests",
+        "rate limit",
+        "timeout",
+        "timed out",
+        "temporarily unavailable",
+        "connection reset",
+        "remote end closed connection",
+        "bad gateway",
+        "gateway timeout",
+        "service unavailable",
+    ]
+    return any(term in s for term in transient_terms)
+
+
+def safe_datafeed_hex(datafeed_id) -> str:
+    if hasattr(datafeed_id, "hex"):
+        h = datafeed_id.hex().lower()
+    elif isinstance(datafeed_id, (bytes, bytearray)):
+        h = datafeed_id.hex().lower()
+    else:
+        h = str(datafeed_id).lower()
+    if h.startswith("0x"):
+        h = h[2:]
+    return h
+
+
+def load_from_block(default_from_block: int, latest_block: int) -> int:
+    if not INCREMENTAL_MODE:
+        return default_from_block
+
+    if os.path.exists(LAST_BLOCK_FILE):
+        try:
+            with open(LAST_BLOCK_FILE, "r", encoding="utf-8") as f:
+                saved = int(f.read().strip())
+            return max(default_from_block, min(saved + 1, latest_block))
+        except Exception:
+            return default_from_block
+
+    return default_from_block
+
+
+def save_last_block(block_number: int) -> None:
+    if not INCREMENTAL_MODE:
+        return
+    with open(LAST_BLOCK_FILE, "w", encoding="utf-8") as f:
+        f.write(str(block_number))
+
+
+def fmt_seconds(seconds: float) -> str:
+    if seconds is None or seconds < 0:
+        return "n/a"
+    s = int(seconds)
+    h = s // 3600
+    m = (s % 3600) // 60
+    sec = s % 60
+    if h > 0:
+        return f"{h}h {m:02d}m {sec:02d}s"
+    return f"{m}m {sec:02d}s"
+
+
+def get_logs_resilient(params: dict, max_retries: int = 8):
+    for attempt in range(max_retries):
+        try:
+            return w3.eth.get_logs(params)
+        except Exception as e:
+            msg = str(e)
+            msg_l = msg.lower()
+
+            if is_range_too_large_error(msg):
+                raise
+
+            # explicit auth issues
+            if (
+                "unauthorized" in msg_l
+                or "authenticate your request" in msg_l
+                or "invalid api key" in msg_l
+                or "forbidden" in msg_l
+            ):
+                rotate_rpc("auth error on get_logs")
+                wait = min(20, 2 ** attempt)
+                print(f"  Auth error. Sleeping {wait}s; retrying same batch...")
+                time.sleep(wait)
+                continue
+
+            # generic bad request -> rotate after first retry
+            if "400 client error" in msg_l or "bad request" in msg_l:
+                if attempt >= 1:
+                    rotate_rpc("persistent 400 on get_logs")
+                wait = min(20, 2 ** attempt)
+                print(f"  400/BadRequest. Sleeping {wait}s; retrying same batch...")
+                time.sleep(wait)
+                continue
+
+            if is_transient_error(msg):
+                if is_rate_limit_error(msg):
+                    rotate_rpc("rate limited on get_logs")
+                wait = min(45, 2 ** attempt)
+                print(f"  Transient error. Sleeping {wait}s; retrying same batch...")
+                time.sleep(wait)
+                continue
+
+            raise
+
+    raise Exception("Max retries exceeded in get_logs_resilient")
+
+
+
+def get_block_timestamp_cached(block_number: int, cache: dict) -> int:
+    if block_number in cache:
+        return cache[block_number]
+
+    for attempt in range(6):
+        try:
+            ts = w3.eth.get_block(block_number)["timestamp"]
+            cache[block_number] = ts
+            return ts
+        except Exception as e:
+            msg = str(e)
+            if is_transient_error(msg):
+                if is_rate_limit_error(msg):
+                    rotate_rpc("rate limited on get_block")
+                wait = min(20, 2 ** attempt)
+                time.sleep(wait)
+                continue
+            raise
+
+    raise Exception(f"Failed to fetch timestamp for block {block_number}")
+
+
+def load_existing_daily_nav(filename: str, feeds) -> dict:
+    result = {feed: {} for feed in feeds}
+
+    if not os.path.exists(filename):
+        return result
+
+    try:
+        xls = pd.ExcelFile(filename, engine="openpyxl")
+    except Exception:
+        print(f"Warning: could not open existing file {filename}; continuing without merge.")
+        return result
+
+    for feed in feeds:
+        if feed not in xls.sheet_names:
+            continue
+        try:
+            df = pd.read_excel(xls, sheet_name=feed)
+        except Exception:
+            continue
+
+        if "Date" not in df.columns or "NAV/Share" not in df.columns:
+            continue
+
+        dts = pd.to_datetime(df["Date"], errors="coerce")
+        navs = pd.to_numeric(df["NAV/Share"], errors="coerce")
+
+        for d, nav in zip(dts, navs):
+            if pd.notna(d) and pd.notna(nav):
+                result[feed][d.date()] = float(nav)
+
+    return result
+
+
+def build_metrics_dataframe(daily_nav: dict) -> pd.DataFrame:
+    if not daily_nav:
+        return pd.DataFrame(columns=[
+            "Date", "NAV/Share", "Daily % change", "daily_return",
+            "APY 7D", "APY 30D", "APY 90D", "APY Since Inception", "Sharpe Ratio"
+        ])
+
+    rows = []
+    prev_nav = None
+    for d in sorted(daily_nav.keys()):
+        nav = float(daily_nav[d])
+
+        if prev_nav is None or prev_nav == 0:
+            daily_pct = None
+            daily_ret = None
+        else:
+            daily_pct = ((nav - prev_nav) / prev_nav) * 100.0
+            daily_ret = daily_pct / 100.0
+
+        rows.append({
+            "Date": d,
+            "NAV/Share": nav,
+            "Daily % change": daily_pct,
+            "daily_return": daily_ret,
+        })
+        prev_nav = nav
+
+    df = pd.DataFrame(rows)
+
+    # rolling APYs
+    for window in (7, 30, 90):
+        col = f"APY {window}D"
+        if len(df) < window:
+            df[col] = pd.NA
+        else:
+            df[col] = (
+                (1 + df["daily_return"])
+                .rolling(window=window, min_periods=window)
+                .apply(lambda x: (x.prod() ** (365.0 / window)) - 1.0, raw=False)
+            ) * 100.0
+
+    # since inception APY (require >=7 calendar days)
+    inception_apy = pd.NA
+    if len(df) >= 2:
+        first_nav = float(df["NAV/Share"].iloc[0])
+        last_nav = float(df["NAV/Share"].iloc[-1])
+        first_date = pd.to_datetime(df["Date"].iloc[0]).date()
+        last_date = pd.to_datetime(df["Date"].iloc[-1]).date()
+        days_elapsed = (last_date - first_date).days
+
+        if first_nav > 0 and last_nav > 0 and days_elapsed >= 7:
+            total_return = last_nav / first_nav
+            inception_apy = (total_return ** (365.0 / days_elapsed) - 1.0) * 100.0
+
+    df["APY Since Inception"] = inception_apy
+
+    # Sharpe ratio (annualised, rf~0)
+    sharpe = pd.NA
+    dr = pd.to_numeric(df["daily_return"], errors="coerce").dropna()
+    if len(dr) >= 7:
+        std_daily = dr.std()
+        if std_daily and std_daily > 0:
+            mean_daily = dr.mean()
+            sharpe = (mean_daily / std_daily) * (365.0 ** 0.5)
+
+    df["Sharpe Ratio"] = sharpe
+
+    return df
+
+
+def latest_non_null(series: pd.Series):
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    return s.iloc[-1] if len(s) > 0 else None
+
+
+# =============================
+# Main
+# =============================
+
+overall_start_ts = time.time()
+
+connect_web3()
+print(f"Connected via RPC: {current_rpc()}")
+
 latest_block = w3.eth.block_number
-from_block = REDSTONE_ADAPTER_CREATION_BLOCK
-print(f"Querying from block {from_block} (Redstone multifeed adapter creation) to {latest_block}...")
-to_block = 'latest'
+print(f"Latest block: {latest_block}")
+
+from_block = load_from_block(REDSTONE_ADAPTER_CREATION_BLOCK, latest_block)
+
+if from_block > latest_block:
+    print("Nothing new to fetch (from_block > latest_block).")
+    sys.exit(0)
+
+total_block_span = (latest_block - from_block + 1)
+
+print(f"\nFetching ValueUpdate events for feeds: {', '.join(ORACLE_IDS.values())}")
+print(f"Querying blocks {from_block} -> {latest_block} (span: {total_block_span:,} blocks)")
 
 if TEST_MODE:
-    print(f"TEST MODE: Will limit output to first {TEST_SAMPLE_SIZE} samples per vault")
+    print(f"TEST MODE: limiting final output to first {TEST_SAMPLE_SIZE} rows per vault")
 
-# Query all ValueUpdate events in batches to avoid 10,000 result limit
+contract = w3.eth.contract(
+    address=Web3.to_checksum_address(REDSTONE_MULTIFEED_ADAPTER),
+    abi=CONTRACT_ABI,
+)
+value_update_event = contract.events.ValueUpdate
+
+batch_size = DEFAULT_BATCH_SIZE
+current_from = from_block
+total_logs = 0
 nav_updates = []
-try:
-    # Get the event signature hash for ValueUpdate event
-    # Event signature: ValueUpdate(uint256,bytes32,uint256)
-    value_update_event = contract.events.ValueUpdate
-    event_signature = "ValueUpdate(uint256,bytes32,uint256)"
-    event_signature_hash = Web3.keccak(text=event_signature)
-    
-    # Query in smaller batches to avoid hitting the 10,000 result limit
-    batch_size = 5000  # Query 5000 blocks at a time
-    current_from = from_block
-    total_logs = 0
-    
-    print("Querying in batches to avoid result limit...")
-    
-    while current_from <= latest_block:
-        current_to = min(current_from + batch_size - 1, latest_block)
-        
-        try:
-            # Use w3.eth.get_logs() with the event filter
-            logs = w3.eth.get_logs({
-                'fromBlock': current_from,
-                'toBlock': current_to,
-                'address': Web3.to_checksum_address(redstone_multifeed_adapter),
-                'topics': [event_signature_hash]  # Filter by event signature
-            })
-            
-            total_logs += len(logs)
-            print(f"  Blocks {current_from}-{current_to}: Found {len(logs)} ValueUpdate events")
-            
-            # Decode and filter events where dataFeedId matches any of our oracle IDs
-            for log in logs:
-                try:
-                    # Decode the log using the contract event
-                    decoded_event = value_update_event.process_log(log)
-                    event_data_feed_id = decoded_event.args.dataFeedId
-                    
-                    # Convert to hex string for comparison (handles HexBytes, bytes, etc.)
-                    if hasattr(event_data_feed_id, 'hex'):
-                        event_id_hex = event_data_feed_id.hex().lower()
-                    elif isinstance(event_data_feed_id, bytes):
-                        event_id_hex = event_data_feed_id.hex().lower()
-                    else:
-                        event_id_hex = str(event_data_feed_id).lower()
-                    
-                    # Remove '0x' prefix if present for comparison
-                    if event_id_hex.startswith('0x'):
-                        event_id_hex = event_id_hex[2:]
-                    
-                    # Check if this event matches any of our oracle IDs
-                    if event_id_hex in oracle_id_hex_set:
-                        # Get the feed name for this oracle ID
-                        feed_name = oracle_id_to_feed.get(event_id_hex)
-                        
-                        # Get block timestamp for date grouping
-                        try:
-                            block = w3.eth.get_block(decoded_event.blockNumber)
-                            block_timestamp = block['timestamp']
-                            dt = datetime.fromtimestamp(block_timestamp)
-                        except:
-                            # If we can't get timestamp now, we'll get it later
-                            dt = None
-                        
-                        # Convert NAV value to NAV/Share (divide by 10^8 for 8 decimals)
-                        nav_value_raw = decoded_event.args.value
-                        nav_per_share = nav_value_raw / (10 ** NAV_DECIMALS)
-                        
-                        # Store the event with feed name, date, and NAV/Share
-                        nav_updates.append({
-                            'event': decoded_event,
-                            'feed': feed_name,
-                            'datetime': dt,
-                            'nav_per_share': nav_per_share,
-                            'block_number': decoded_event.blockNumber
-                        })
-                except Exception as decode_error:
-                    # Skip logs that can't be decoded (shouldn't happen, but just in case)
-                    continue
-            
-            # Move to next batch
-            current_from = current_to + 1
-            
-        except Exception as batch_error:
-            # If we hit the limit, try smaller batches
-            error_msg = str(batch_error)
-            if 'more than 10000 results' in error_msg or '10000' in error_msg:
-                print(f"  Hit result limit for blocks {current_from}-{current_to}, trying smaller batch...")
-                # Try with half the batch size
-                batch_size = max(1000, batch_size // 2)
-                continue
-            else:
-                # Other error, try to continue with next batch
-                print(f"  Error querying blocks {current_from}-{current_to}: {batch_error}")
+block_timestamp_cache = {}
+
+print("\nQuerying in batches...")
+
+# for progress/ETA
+processed_blocks = 0
+batch_counter = 0
+
+while current_from <= latest_block:
+    active_batch = effective_batch_size(batch_size)
+    current_to = min(current_from + active_batch - 1, latest_block)
+
+    params = {
+        "fromBlock": current_from,
+        "toBlock": current_to,
+        "address": Web3.to_checksum_address(REDSTONE_MULTIFEED_ADAPTER),
+        "topics": [EVENT_SIG_HASH],
+    }
+
+    try:
+        logs = get_logs_resilient(params)
+    except Exception as e:
+        msg = str(e)
+
+        if is_range_too_large_error(msg):
+            new_batch_size = max(MIN_BATCH_SIZE, batch_size // 2)
+            if new_batch_size == batch_size:
+                raise Exception(
+                    f"Cannot reduce batch size further (already {batch_size}) but still hitting limit."
+                ) from e
+
+            print(
+                f"  Range/result limit in {current_from}-{current_to}; "
+                f"batch {batch_size} -> {new_batch_size}, retrying same range..."
+            )
+            batch_size = new_batch_size
+            continue
+
+        print(f"  Error querying blocks {current_from}-{current_to}: {e}")
+
+        if ALLOW_SKIP:
+                print("  --allow-skip enabled: skipping this range.")
+                processed_blocks += (current_to - current_from + 1)
                 current_from = current_to + 1
                 continue
-    
-    print(f"\nTotal: Found {total_logs} ValueUpdate event logs across all batches")
-    print(f"Found {len(nav_updates)} NAV updates matching any of the oracle IDs")
-    
-except Exception as e:
-    print(f"Error querying ValueUpdate events: {e}")
-    import traceback
-    traceback.print_exc()
 
-# Sort by block number (oldest first)
-if nav_updates:
-    nav_updates.sort(key=lambda x: x['block_number'])
-    
-    # Get timestamps for any updates that don't have them yet
-    print("\nFetching block timestamps for NAV updates...")
-    for update in nav_updates:
-        if update['datetime'] is None:
-            try:
-                block = w3.eth.get_block(update['block_number'])
-                block_timestamp = block['timestamp']
-                update['datetime'] = datetime.fromtimestamp(block_timestamp)
-            except:
-                print(f"Warning: Could not get timestamp for block {update['block_number']}")
-    
-    # Group NAV updates by feed and date
-    # For each date, we'll use the last NAV value of that day (to handle intra-day changes)
-    print("\nProcessing NAV updates and calculating daily changes...")
-    
-    vault_data = defaultdict(list)  # feed -> list of {date, nav_per_share, daily_pct_change}
-    
-    for feed_name in ORACLE_IDS.values():
-        # Get all updates for this feed
-        feed_updates = [u for u in nav_updates if u['feed'] == feed_name]
-        
-        if not feed_updates:
-            print(f"No updates found for {feed_name}")
+
+        print("  Strict mode: keeping same range, sleeping 15s, then retrying...")
+        time.sleep(15)
+        continue
+
+    total_logs += len(logs)
+    batch_counter += 1
+
+    print(f"  Blocks {current_from}-{current_to}: Found {len(logs)} ValueUpdate events")
+
+    for log in logs:
+        try:
+            decoded = value_update_event.process_log(log)
+        except Exception:
             continue
-        
-        # Group by date (use the last NAV value of each day)
-        daily_nav = {}  # date -> nav_per_share (last value of the day)
-        
-        for update in feed_updates:
-            if update['datetime'] is None:
-                continue
-            
-            update_date = update['datetime'].date()
-            # Keep the last NAV value for each date (since we're sorted by block number)
-            daily_nav[update_date] = update['nav_per_share']
-        
-        # Sort dates
-        sorted_dates = sorted(daily_nav.keys())
-        
-        # Calculate daily % changes
-        previous_nav = None
-        for current_date in sorted_dates:
-            current_nav = daily_nav[current_date]
-            
-            if previous_nav is not None:
-                # Calculate daily % change
-                daily_pct_change = ((current_nav - previous_nav) / previous_nav) * 100
-            else:
-                # First day has no previous value
-                daily_pct_change = None
-            
-            vault_data[feed_name].append({
-                'Date': current_date,
-                'NAV/Share': current_nav,
-                'Daily % change': daily_pct_change
-            })
-            
-            previous_nav = current_nav
-        
-        print(f"  {feed_name}: {len(vault_data[feed_name])} daily records")
-    
-    # Apply test mode limit if enabled
-    if TEST_MODE:
-        print(f"\nApplying test mode: limiting to first {TEST_SAMPLE_SIZE} samples per vault...")
-        for feed_name in vault_data:
-            vault_data[feed_name] = vault_data[feed_name][:TEST_SAMPLE_SIZE]
-    
-    # Create Excel file with one sheet per vault (CSV doesn't support multiple tabs)
-    output_filename = 'nav_volatility_analysis_test.xlsx' if TEST_MODE else 'nav_volatility_analysis.xlsx'
-    print(f"\nExporting to {output_filename}...")
-    
-    # Create Excel writer for multiple sheets
-    with pd.ExcelWriter(output_filename, engine='openpyxl') as writer:
-        for feed_name in sorted(vault_data.keys()):
-            df = pd.DataFrame(vault_data[feed_name])
-            
-            # Format the data
-            df['Date'] = pd.to_datetime(df['Date']).dt.strftime('%m/%d/%Y')
-            df['NAV/Share'] = df['NAV/Share'].round(6)
-            df['Daily % change'] = df['Daily % change'].apply(
-                lambda x: f"{x:.5f}%" if x is not None else ""
-            )
-            
-            # Write to sheet
-            df.to_excel(writer, sheet_name=feed_name, index=False)
-            print(f"  Created sheet '{feed_name}' with {len(df)} rows")
-    
-    print(f"\nSuccessfully exported volatility analysis to {output_filename}")
-    print(f"  Total vaults: {len(vault_data)}")
-    
-    # Also print a summary to console
-    print(f"\n{'='*100}")
-    print(f"SUMMARY")
-    print(f"{'='*100}\n")
-    
-    for feed_name in sorted(vault_data.keys()):
-        data = vault_data[feed_name]
-        print(f"{feed_name}:")
-        print(f"  Total days: {len(data)}")
-        if data:
-            changes = [d['Daily % change'] for d in data if d['Daily % change'] is not None]
-            if changes:
-                max_loss = min(changes)
-                daily_std = pd.Series(changes).std()
-                print(f"  Max Loss: {max_loss:.5f}%")
-                print(f"  Daily Std Dev: {daily_std:.8f}")
-            print(f"  NAV Range: {min(d['NAV/Share'] for d in data):.6f} - {max(d['NAV/Share'] for d in data):.6f}")
-        print()
-    
-else:
-    print(f"\nNo NAV updates found for any of the oracle IDs")
-    print("You may need to adjust the from_block range or check if the contract has emitted events.")
 
+        event_id_hex = safe_datafeed_hex(decoded.args.dataFeedId)
+        if event_id_hex not in ORACLE_ID_HEX_SET:
+            continue
+
+        feed_name = ORACLE_ID_TO_FEED[event_id_hex]
+        bn = decoded.blockNumber
+
+        try:
+            ts = get_block_timestamp_cached(bn, block_timestamp_cache)
+            dt = datetime.fromtimestamp(ts)
+        except Exception:
+            dt = None
+
+        nav_raw = decoded.args.value
+        nav_per_share = nav_raw / (10 ** NAV_DECIMALS)
+
+        nav_updates.append({
+            "feed": feed_name,
+            "datetime": dt,
+            "nav_per_share": nav_per_share,
+            "block_number": bn,
+        })
+
+    # Progress + ETA
+    step_blocks = (current_to - current_from + 1)
+    processed_blocks += step_blocks
+    elapsed = time.time() - overall_start_ts
+    progress = processed_blocks / total_block_span if total_block_span > 0 else 1.0
+    eta = (elapsed / progress) - elapsed if progress > 0 else None
+    expected_total = (elapsed / progress) if progress > 0 else None
+
+    if batch_counter % 5 == 0 or current_to == latest_block:
+        print(
+            f"    Progress: {progress*100:.2f}% | "
+            f"Elapsed: {fmt_seconds(elapsed)} | "
+            f"ETA: {fmt_seconds(eta)} | "
+            f"Expected total: {fmt_seconds(expected_total)} | "
+            f"RPC: {current_rpc()}"
+        )
+
+    current_from = current_to + 1
+
+print(f"\nTotal logs found: {total_logs}")
+print(f"Matching NAV updates: {len(nav_updates)}")
+
+if INCREMENTAL_MODE:
+    save_last_block(latest_block)
+    print(f"Saved last processed block: {latest_block} -> {LAST_BLOCK_FILE}")
+
+# Build new daily NAV map
+new_daily_nav = {feed: {} for feed in ORACLE_IDS.values()}
+
+if nav_updates:
+    nav_updates.sort(key=lambda x: x["block_number"])
+
+for upd in nav_updates:
+    if upd["datetime"] is None:
+        continue
+    d = upd["datetime"].date()
+    new_daily_nav[upd["feed"]][d] = float(upd["nav_per_share"])  # last event/day wins
+
+# Merge with existing history in incremental mode
+if INCREMENTAL_MODE and not TEST_MODE:
+    existing_daily_nav = load_existing_daily_nav(OUTPUT_FILENAME, ORACLE_IDS.values())
+else:
+    existing_daily_nav = {feed: {} for feed in ORACLE_IDS.values()}
+
+merged_daily_nav = {}
+for feed in ORACLE_IDS.values():
+    combined = dict(existing_daily_nav.get(feed, {}))
+    combined.update(new_daily_nav.get(feed, {}))
+    merged_daily_nav[feed] = combined
+
+if all(len(v) == 0 for v in merged_daily_nav.values()):
+    print("\nNo NAV updates found and no existing history to merge.")
+    print("You may need to adjust from_block or run once without --incremental.")
+    sys.exit(0)
+
+vault_frames = {}
+for feed in ORACLE_IDS.values():
+    df = build_metrics_dataframe(merged_daily_nav[feed])
+    if TEST_MODE and not df.empty:
+        df = df.head(TEST_SAMPLE_SIZE).copy()
+    vault_frames[feed] = df
+    print(f"  {feed}: {len(df)} daily rows")
+
+print(f"\nExporting to {OUTPUT_FILENAME}...")
+
+with pd.ExcelWriter(OUTPUT_FILENAME, engine="openpyxl") as writer:
+    for feed in sorted(vault_frames.keys()):
+        df = vault_frames[feed].copy()
+
+        output_cols = [
+            "Date",
+            "NAV/Share",
+            "Daily % change",
+            "APY 7D",
+            "APY 30D",
+            "APY 90D",
+            "APY Since Inception",
+            "Sharpe Ratio",
+        ]
+
+        if df.empty:
+            pd.DataFrame(columns=output_cols).to_excel(writer, sheet_name=feed, index=False)
+            continue
+
+        for col in output_cols:
+            if col not in df.columns:
+                df[col] = pd.NA
+
+        df = df[output_cols]
+
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.strftime("%m/%d/%Y")
+        df["NAV/Share"] = pd.to_numeric(df["NAV/Share"], errors="coerce").round(6)
+
+        pct_cols = ["Daily % change", "APY 7D", "APY 30D", "APY 90D", "APY Since Inception"]
+        for col in pct_cols:
+            df[col] = df[col].apply(lambda x: f"{x:.5f}%" if pd.notna(x) else "")
+
+        df["Sharpe Ratio"] = df["Sharpe Ratio"].apply(lambda x: f"{x:.4f}" if pd.notna(x) else "")
+
+        df.to_excel(writer, sheet_name=feed, index=False)
+        print(f"  Created sheet '{feed}' with {len(df)} rows")
+
+print(f"\nSuccessfully exported: {OUTPUT_FILENAME}")
+
+print("\n" + "=" * 110)
+print("SUMMARY")
+print("=" * 110)
+
+for feed in sorted(vault_frames.keys()):
+    raw_df = vault_frames[feed]
+    print(f"\n{feed}:")
+    print(f"  Total days: {len(raw_df)}")
+
+    if raw_df.empty:
+        print("  No data")
+        continue
+
+    changes = pd.to_numeric(raw_df["Daily % change"], errors="coerce").dropna()
+    navs = pd.to_numeric(raw_df["NAV/Share"], errors="coerce").dropna()
+
+    if len(changes) > 0:
+        print(f"  Max Loss: {changes.min():.5f}%")
+        print(f"  Daily Std Dev: {changes.std():.8f}")
+    else:
+        print("  Max Loss: n/a")
+        print("  Daily Std Dev: n/a")
+
+    if len(navs) > 0:
+        print(f"  NAV Range: {navs.min():.6f} - {navs.max():.6f}")
+
+    apy7 = latest_non_null(raw_df["APY 7D"]) if "APY 7D" in raw_df.columns else None
+    apy30 = latest_non_null(raw_df["APY 30D"]) if "APY 30D" in raw_df.columns else None
+    apy90 = latest_non_null(raw_df["APY 90D"]) if "APY 90D" in raw_df.columns else None
+    apy_inc = latest_non_null(raw_df["APY Since Inception"]) if "APY Since Inception" in raw_df.columns else None
+    sharpe = latest_non_null(raw_df["Sharpe Ratio"]) if "Sharpe Ratio" in raw_df.columns else None
+
+    print(f"  Latest APY 7D: {apy7:.3f}%" if apy7 is not None else "  Latest APY 7D: n/a")
+    print(f"  Latest APY 30D: {apy30:.3f}%" if apy30 is not None else "  Latest APY 30D: n/a")
+    print(f"  Latest APY 90D: {apy90:.3f}%" if apy90 is not None else "  Latest APY 90D: n/a")
+    print(f"  APY Since Inception: {apy_inc:.3f}%" if apy_inc is not None else "  APY Since Inception: n/a")
+    print(f"  Sharpe Ratio: {sharpe:.4f}" if sharpe is not None else "  Sharpe Ratio: n/a")
+
+total_elapsed = time.time() - overall_start_ts
+print(f"\nDone. Total runtime: {fmt_seconds(total_elapsed)}")
