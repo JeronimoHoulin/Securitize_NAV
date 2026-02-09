@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import json
 from datetime import datetime
 
 import pandas as pd
@@ -14,19 +15,14 @@ from web3 import Web3
 load_dotenv()
 
 INFURA_API_KEY = os.getenv("INFURA_API_KEY") or os.getenv("api_key")
-ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY")
+# ALCHEMY disabled for now (free tier too restrictive for getLogs range)
+# ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY")
 
 if not INFURA_API_KEY:
     raise Exception("Missing INFURA_API_KEY in .env (or legacy api_key)")
 
-# remove this entirely for now:
-# if not ALCHEMY_API_KEY:
-#if not ALCHEMY_API_KEY:
-#    raise Exception("Missing ALCHEMY_API_KEY in .env")
-
 RPCS = [
     f"https://mainnet.infura.io/v3/{INFURA_API_KEY}",
-    # f"https://eth-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}", - removed since free plan is very restrictive
     "https://eth.llamarpc.com",
 ]
 
@@ -38,11 +34,13 @@ ORACLE_IDS = {
     "0x484c53636f70655f46554e44414d454e54414c00000000000000000000000000": "HLSCOPE",
 }
 
+INCEPTION_ANCHOR_FILE = "inception_anchor.json"
+
 ORACLE_ID_HEX_SET = {oid[2:].lower() for oid in ORACLE_IDS.keys()}
 ORACLE_ID_TO_FEED = {oid[2:].lower(): name for oid, name in ORACLE_IDS.items()}
 
 NAV_DECIMALS = 8
-REDSTONE_ADAPTER_CREATION_BLOCK = 20419584
+REDSTONE_ADAPTER_CREATION_BLOCK = 20419584  # 20419584 = real Redstone creation; can also run 24035770 for STAC only
 
 DEFAULT_BATCH_SIZE = 2000
 MIN_BATCH_SIZE = 250
@@ -51,8 +49,7 @@ LLAMA_MAX_BLOCK_RANGE = 1000  # llamaRPC eth_getLogs hard range cap
 TEST_MODE = "--test" in sys.argv
 TEST_SAMPLE_SIZE = 10
 
-ALLOW_SKIP = "--allow-skip" in sys.argv ##optional skip when you explicitly want speed over precision
-
+ALLOW_SKIP = "--allow-skip" in sys.argv  # optional: skip bad ranges for speed over precision
 
 INCREMENTAL_MODE = "--incremental" in sys.argv
 LAST_BLOCK_FILE = "last_processed_block.txt"
@@ -84,6 +81,7 @@ w3 = None
 # rotate cooldown to avoid rapid RPC ping-pong
 _last_rotate_ts = 0.0
 ROTATE_COOLDOWN_SEC = 10
+
 
 def connect_web3() -> Web3:
     global w3
@@ -124,8 +122,6 @@ def rotate_rpc(reason: str = "") -> None:
     raise Exception("No reachable RPC endpoint available")
 
 
-
-
 def current_rpc() -> str:
     return RPCS[_current_rpc_idx]
 
@@ -143,6 +139,19 @@ def effective_batch_size(base_batch_size: int) -> int:
 # =============================
 # Helpers
 # =============================
+
+def load_inception_anchors(path: str) -> dict:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # expected: {feed: {"date":"YYYY-MM-DD","nav":float}}
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"Warning: could not parse {path}: {e}")
+        return {}
+
 
 def is_rate_limit_error(msg: str) -> bool:
     s = msg.lower()
@@ -269,7 +278,6 @@ def get_logs_resilient(params: dict, max_retries: int = 8):
     raise Exception("Max retries exceeded in get_logs_resilient")
 
 
-
 def get_block_timestamp_cached(block_number: int, cache: dict) -> int:
     if block_number in cache:
         return cache[block_number]
@@ -325,7 +333,7 @@ def load_existing_daily_nav(filename: str, feeds) -> dict:
     return result
 
 
-def build_metrics_dataframe(daily_nav: dict) -> pd.DataFrame:
+def build_metrics_dataframe(daily_nav: dict, feed_name: str, anchors: dict) -> pd.DataFrame:
     if not daily_nav:
         return pd.DataFrame(columns=[
             "Date", "NAV/Share", "Daily % change", "daily_return",
@@ -366,17 +374,41 @@ def build_metrics_dataframe(daily_nav: dict) -> pd.DataFrame:
                 .apply(lambda x: (x.prod() ** (365.0 / window)) - 1.0, raw=False)
             ) * 100.0
 
-    # since inception APY (require >=7 calendar days)
+    # since inception APY (anchor-aware, require >=7 calendar days)
     inception_apy = pd.NA
-    if len(df) >= 2:
-        first_nav = float(df["NAV/Share"].iloc[0])
-        last_nav = float(df["NAV/Share"].iloc[-1])
-        first_date = pd.to_datetime(df["Date"].iloc[0]).date()
-        last_date = pd.to_datetime(df["Date"].iloc[-1]).date()
-        days_elapsed = (last_date - first_date).days
 
-        if first_nav > 0 and last_nav > 0 and days_elapsed >= 7:
-            total_return = last_nav / first_nav
+    anchor_nav = None
+    anchor_date = None
+
+    if len(df) >= 1:
+        anchor_nav = float(df["NAV/Share"].iloc[0])
+        anchor_date = pd.to_datetime(df["Date"].iloc[0]).date()
+
+    feed_anchor = anchors.get(feed_name)
+    if isinstance(feed_anchor, dict):
+        try:
+            a_date = pd.to_datetime(feed_anchor.get("date")).date()
+            a_nav = float(feed_anchor.get("nav"))
+
+            # if anchor date exists in df, use df NAV for that date
+            mask = pd.to_datetime(df["Date"], errors="coerce").dt.date == a_date
+            if mask.any():
+                a_nav = float(df.loc[mask, "NAV/Share"].iloc[-1])
+
+            last_date_tmp = pd.to_datetime(df["Date"].iloc[-1]).date()
+            if a_date <= last_date_tmp and a_nav > 0:
+                anchor_date = a_date
+                anchor_nav = a_nav
+        except Exception:
+            pass
+
+    if len(df) >= 2 and anchor_nav is not None and anchor_date is not None:
+        last_nav = float(df["NAV/Share"].iloc[-1])
+        last_date = pd.to_datetime(df["Date"].iloc[-1]).date()
+        days_elapsed = (last_date - anchor_date).days
+
+        if anchor_nav > 0 and last_nav > 0 and days_elapsed >= 7:
+            total_return = last_nav / anchor_nav
             inception_apy = (total_return ** (365.0 / days_elapsed) - 1.0) * 100.0
 
     df["APY Since Inception"] = inception_apy
@@ -425,6 +457,12 @@ print(f"Querying blocks {from_block} -> {latest_block} (span: {total_block_span:
 
 if TEST_MODE:
     print(f"TEST MODE: limiting final output to first {TEST_SAMPLE_SIZE} rows per vault")
+
+anchors = load_inception_anchors(INCEPTION_ANCHOR_FILE)
+if anchors:
+    print(f"Loaded inception anchors from {INCEPTION_ANCHOR_FILE}: {', '.join(sorted(anchors.keys()))}")
+else:
+    print("No inception anchors loaded; using dataset-first-date per vault.")
 
 contract = w3.eth.contract(
     address=Web3.to_checksum_address(REDSTONE_MULTIFEED_ADAPTER),
@@ -477,11 +515,10 @@ while current_from <= latest_block:
         print(f"  Error querying blocks {current_from}-{current_to}: {e}")
 
         if ALLOW_SKIP:
-                print("  --allow-skip enabled: skipping this range.")
-                processed_blocks += (current_to - current_from + 1)
-                current_from = current_to + 1
-                continue
-
+            print("  --allow-skip enabled: skipping this range.")
+            processed_blocks += (current_to - current_from + 1)
+            current_from = current_to + 1
+            continue
 
         print("  Strict mode: keeping same range, sleeping 15s, then retrying...")
         time.sleep(15)
@@ -578,7 +615,7 @@ if all(len(v) == 0 for v in merged_daily_nav.values()):
 
 vault_frames = {}
 for feed in ORACLE_IDS.values():
-    df = build_metrics_dataframe(merged_daily_nav[feed])
+    df = build_metrics_dataframe(merged_daily_nav[feed], feed, anchors)
     if TEST_MODE and not df.empty:
         df = df.head(TEST_SAMPLE_SIZE).copy()
     vault_frames[feed] = df
