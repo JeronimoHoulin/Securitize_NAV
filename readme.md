@@ -1,13 +1,13 @@
 # Securitize NAV Updates Analysis
 
-This repository contains scripts for analyzing Securitize vault NAV (Net Asset Value) data from the Ethereum mainnet:
+This repository contains scripts for analysing Securitize vault NAV (Net Asset Value) data from Ethereum mainnet:
 
-1. **`nav_updates.py`** - Fetches NAV updates for multiple vaults (VBILL, STAC, ACRED, HLSCOPE) from the Redstone multifeed adapter contract
-2. **`vbill_nav_tracker.py`** - Tracks VBILL token supply changes and calculates daily interest/yield from issuance contract transactions
+1. **`nav_updates.py`** - Fetches NAV updates for **STAC, ACRED, and HLSCOPE** from the Redstone multifeed adapter contract, then computes daily metrics and APY windows.
+2. **`vbill_nav_tracker.py`** - Tracks VBILL token supply changes and calculates daily interest/yield from issuance contract transactions.
 
 ## Setup
 
-### 1. Install Dependencies
+### 1. Install dependencies
 
 **Using uv (recommended):**
 ```bash
@@ -19,45 +19,123 @@ uv sync
 pip install -r requirements.txt
 ```
 
-Both methods work identically. `uv` is faster and recommended if you have it installed.
+Both methods work. `uv` is typically faster.
 
-### 2. Environment Variables
+### 2. Environment variables
 
-Create a `.env` file in the project root directory with the following variable:
+Create a `.env` file in the project root with:
 
-- `api_key`: Your Infura API key for connecting to Ethereum mainnet
+- `INFURA_API_KEY` (preferred), or
+- `api_key` (legacy fallback)
 
 See `example.env` for a template.
 
-### 3. Run the Script
+### 3. Run the script (`nav_updates.py`)
 
-#### Basic Usage
+#### Basic usage
 ```bash
 python nav_updates.py
 ```
 
-This will query from block 20419584 (when the Redstone multifeed adapter was created) to the latest block for NAV updates and generate `nav_volatility_analysis.xlsx`.
+Queries from block `20419584` (Redstone adapter creation) to latest and generates `nav_volatility_analysis.xlsx`.
 
-#### Test Mode
+#### Test mode
 ```bash
 python nav_updates.py --test
 ```
 
-Limits the output to the first 10 samples per vault and generates `nav_volatility_analysis_test.xlsx`. Useful for testing and quick validation.
+Limits output to the first 10 rows per vault and writes `nav_volatility_analysis_test.xlsx`.
 
-#### Combine Flags
+#### Incremental mode
 ```bash
-python nav_updates.py --test
+python nav_updates.py --incremental
 ```
 
-You can combine flags as needed.
+Reads from `last_processed_block.txt` (if present), merges with existing Excel history, and updates only new blocks.
 
-## Output
+#### Combine flags
+```bash
+python nav_updates.py --incremental --test
+```
 
-The script generates an Excel file (`nav_volatility_analysis.xlsx` or `nav_volatility_analysis_test.xlsx` in test mode) with:
-- One sheet per vault (VBILL, STAC, ACRED, HLSCOPE)
-- Columns: Date, NAV/Share, Daily % change
-- Summary statistics printed to console
+---
+
+## `nav_updates.py` output
+
+The script generates an Excel file (`nav_volatility_analysis.xlsx`, or test variant) with:
+
+- One sheet per vault: **STAC**, **ACRED**, **HLSCOPE**
+- Columns:
+  - `Date`
+  - `NAV/Share`
+  - `Daily % change`
+  - `APY 7D`
+  - `APY 30D`
+  - `APY 90D`
+  - `APY Since Inception`
+  - `Sharpe Ratio`
+
+It also prints a console summary per vault (days, max loss, NAV range, APYs, Sharpe).
+
+---
+
+## Inception anchors (important)
+
+`nav_updates.py` supports optional anchor configuration via:
+
+- **`inception_anchor.json`**
+
+Expected structure:
+```json
+{
+  "STAC": { "date": "2025-12-18", "nav": 1000.0 }
+}
+```
+
+If present, anchor data is used for ‘since inception’ calculations (and any anchor-aware logic in the script).  
+If missing, the script defaults to dataset-first-date behaviour.
+
+---
+
+## Incremental mode behaviour
+
+When using `--incremental`:
+
+- The script reads the start block from `last_processed_block.txt` (plus one).
+- It merges new daily data with existing Excel sheets.
+- It saves the latest processed block back to `last_processed_block.txt`.
+
+If there are no new matching NAV events, it may still finish successfully without adding rows.
+
+---
+
+## RPC and resilience notes
+
+`nav_updates.py` uses:
+
+- Infura (primary, via API key)
+- LlamaRPC (fallback)
+
+The script includes retry logic, RPC rotation, and batch-size handling for transient errors/rate limits.
+
+---
+
+## How `nav_updates.py` works
+
+1. Connects to Ethereum mainnet.
+2. Queries `ValueUpdate` events from Redstone multifeed adapter:
+   - `0xd72a6ba4a87ddb33e801b3f1c7750b2d0911fc6c`
+3. Filters for configured oracle IDs:
+   - STAC
+   - ACRED
+   - HLSCOPE
+4. Builds daily NAV series (last update per day wins).
+5. Computes:
+   - Daily % change
+   - Rolling APY (7/30/90D)
+   - APY since inception
+   - Sharpe ratio
+6. Exports to Excel.
 
 ---
 
@@ -67,7 +145,8 @@ This script tracks VBILL token supply changes by monitoring ERC-20 Transfer even
 
 ### Purpose
 
-The script analyzes VBILL token mints and burns to:
+The script analyses VBILL mints and burns to:
+
 - Track daily interest payments (from `bulkIssuance` function calls)
 - Separate interest-generating mints from other supply increases
 - Calculate daily yield percentages based on interest payments
@@ -75,86 +154,55 @@ The script analyzes VBILL token mints and burns to:
 
 ### Usage
 
-#### Basic Usage
+#### Basic usage
 ```bash
 uv run vbill_nav_tracker.py
 ```
 
-This will query from block 22468524 (when the issuer contract was created) to the latest block and generate `nav_volatility_analysis.xlsx` with a VBILL sheet.
+Queries from block `22468524` (issuer contract creation) to latest and generates `nav_volatility_analysis.xlsx` with a VBILL sheet.
 
-#### Test Mode
+#### Test mode
 ```bash
 uv run vbill_nav_tracker.py --test
 ```
 
-Limits the query to approximately 1 month of blocks (~216,000 blocks) and generates `nav_volatility_analysis_test.xlsx`. Useful for testing and quick validation.
+Limits query range (about 1 month of blocks) and generates `nav_volatility_analysis_test.xlsx`.
 
-### How It Works
+### How it works
 
-The script follows a 4-step process:
+1. **Get all VBILL mint events**: Transfer events with `from = 0x000...000`
+2. **Classify mints** by transaction call:
+   - `bulkIssuance` (`0xb28d07c3`) on issuer contract → **interest**
+   - Other mint paths (for example `bulkRegisterAndIssuance`) → **supply increase**
+3. **Get burn events**: Transfer events with `to = 0x000...000`
+4. **Calculate daily aggregates**:
+   - Interest minted
+   - Supply minted
+   - Burned
+   - Net supply change
+   - Daily yield % (`interest / previous supply`)
+   - Running supply
 
-1. **Get All VBILL Mint Events**: Queries all ERC-20 Transfer events where `from` address is the null address (0x0000...), indicating token minting
-2. **Classify Mint Events**: For each mint event, checks the transaction that created it:
-   - If the transaction calls `bulkIssuance` (0xb28d07c3) on the issuer contract → counts as **interest**
-   - Otherwise (e.g., `bulkRegisterAndIssuance`) → counts as **supply increase** (not interest)
-3. **Get Burn Events**: Queries all Transfer events where `to` address is the null address, indicating token burning (supply decrease)
-4. **Calculate Daily Aggregates**: Groups all events by date and calculates:
-   - Daily interest minted (from `bulkIssuance` only)
-   - Daily supply minted (other mints)
-   - Daily burns
-   - Daily yield percentage (interest / previous supply)
-   - Total supply changes
+### VBILL output columns
 
-### Output
+- `Date`
+- `NAV/Share` (fixed at 1.0)
+- `Daily % change`
+- `Interest_Minted`
+- `Supply_Minted`
+- `Burned`
+- `Net_Supply_Change`
+- `Supply`
 
-The script generates an Excel file (`nav_volatility_analysis.xlsx` or `nav_volatility_analysis_test.xlsx` in test mode) with a VBILL sheet containing:
+### Contract details
 
-- **Date**: Date of the transaction
-- **NAV/Share**: Always 1.0 (VBILL is a rebasing token with fixed NAV)
-- **Daily % change**: Daily yield percentage calculated from interest mints only
-- **Interest_Minted**: VBILL minted from `bulkIssuance` (interest payments)
-- **Supply_Minted**: VBILL minted from other functions (supply increases)
-- **Burned**: VBILL burned (supply decreases)
-- **Net_Supply_Change**: Net change in supply for the day
-- **Supply**: Total supply after the day's changes
-
-The script also prints summary statistics including:
-- Total days tracked
-- Total mint/burn events processed
-- Total interest minted vs supply minted
-- Average, max, and min daily yield percentages
-
-### Key Features
-
-- **Accurate Interest Tracking**: Only counts `bulkIssuance` transactions as interest, not `bulkRegisterAndIssuance`
-- **Daily Aggregation**: Groups events by date for clean daily reporting
-- **Supply Tracking**: Maintains running supply totals to calculate accurate yield percentages
-- **Batch Processing**: Queries events in batches to handle large block ranges efficiently
-- **Error Handling**: Gracefully handles rate limits and continues processing
-
-### Contract Details
-
-- **VBILL Token**: `0x2255718832bc9fd3be1caf75084f4803da14ff01`
-- **Issuer Contract**: `0x22afdb66dc56be3a81285d953124bda8020dcb88`
-- **Contract Creation Block**: 22468524
-- **Interest Function**: `bulkIssuance` (0xb28d07c3)
+- **VBILL token**: `0x2255718832bc9fd3be1caf75084f4803da14ff01`
+- **Issuer contract**: `0x22afdb66dc56be3a81285d953124bda8020dcb88`
+- **Contract creation block**: `22468524`
+- **Interest function**: `bulkIssuance` (`0xb28d07c3`)
 
 ### Notes
 
-- The script queries from block 22468524 (issuer contract creation) onwards
-- VBILL uses 6 decimals (not 18)
-- NAV is always $1.00 for rebasing tokens - the yield is reflected in supply increases
-- Daily yield is calculated as: `(interest_minted / previous_supply) * 100`
-- The script preserves existing Excel sheets when updating the file
-
----
-
-## How It Works (nav_updates.py)
-
-1. Connects to Ethereum mainnet via Infura
-2. Queries `ValueUpdate` events from the Redstone multifeed adapter contract starting from block 20419584 (when the adapter was created)
-3. Filters events for specific oracle IDs (VBILL, STAC, ACRED, HLSCOPE)
-4. Groups NAV updates by date and calculates daily percentage changes
-5. Exports results to Excel with separate sheets for each vault
-
-**Note**: The script only queries from block 20419584 onwards since the Redstone multifeed adapter was created at that block. NAV updates do not exist before this block.
+- VBILL uses 6 decimals.
+- NAV is fixed at $1.00 (rebasing mechanics reflect yield via supply changes).
+- The script preserves existing Excel sheets when updating files.
