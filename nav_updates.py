@@ -8,6 +8,15 @@ import pandas as pd
 from dotenv import load_dotenv
 from web3 import Web3
 
+try:
+    import openpyxl  # noqa: F401
+except Exception:
+    raise SystemExit(
+        "Missing dependency: openpyxl\n"
+        "Install with: python -m pip install openpyxl\n"
+        "Tip: activate your .venv first."
+    )
+
 # =============================
 # Configuration
 # =============================
@@ -390,17 +399,35 @@ def build_metrics_dataframe(daily_nav: dict, feed_name: str, anchors: dict) -> p
             a_date = pd.to_datetime(feed_anchor.get("date")).date()
             a_nav = float(feed_anchor.get("nav"))
 
-            # if anchor date exists in df, use df NAV for that date
-            mask = pd.to_datetime(df["Date"], errors="coerce").dt.date == a_date
-            if mask.any():
-                a_nav = float(df.loc[mask, "NAV/Share"].iloc[-1])
+            # 1) Hard-trim dataset at anchor date so ALL metrics use anchored history
+            date_series = pd.to_datetime(df["Date"], errors="coerce").dt.date
+            df = df[date_series >= a_date].copy()
+            df = df.sort_values("Date").reset_index(drop=True)
 
-            last_date_tmp = pd.to_datetime(df["Date"].iloc[-1]).date()
-            if a_date <= last_date_tmp and a_nav > 0:
-                anchor_date = a_date
-                anchor_nav = a_nav
+            # If trimming removed everything, keep default behaviour
+            if df.empty:
+                anchor_date = None
+                anchor_nav = None
+            else:
+                # 2) Prefer on-dataset NAV at anchor date when available
+                trimmed_dates = pd.to_datetime(df["Date"], errors="coerce").dt.date
+                mask = trimmed_dates == a_date
+                if mask.any():
+                    a_nav = float(df.loc[mask, "NAV/Share"].iloc[-1])
+
+                last_date_tmp = pd.to_datetime(df["Date"].iloc[-1]).date()
+                if a_date <= last_date_tmp and a_nav > 0:
+                    anchor_date = a_date
+                    anchor_nav = a_nav
         except Exception:
             pass
+
+        if df.empty:
+            return pd.DataFrame(columns=[
+                "Date", "NAV/Share", "Daily % change", "daily_return",
+                "APY 7D", "APY 30D", "APY 90D", "APY Since Inception", "Sharpe Ratio"
+            ])
+
 
     if len(df) >= 2 and anchor_nav is not None and anchor_date is not None:
         last_nav = float(df["NAV/Share"].iloc[-1])
@@ -580,10 +607,6 @@ while current_from <= latest_block:
 print(f"\nTotal logs found: {total_logs}")
 print(f"Matching NAV updates: {len(nav_updates)}")
 
-if INCREMENTAL_MODE:
-    save_last_block(latest_block)
-    print(f"Saved last processed block: {latest_block} -> {LAST_BLOCK_FILE}")
-
 # Build new daily NAV map
 new_daily_nav = {feed: {} for feed in ORACLE_IDS.values()}
 
@@ -608,10 +631,27 @@ for feed in ORACLE_IDS.values():
     combined.update(new_daily_nav.get(feed, {}))
     merged_daily_nav[feed] = combined
 
+# Fallback: seed from anchors when no merged history exists
 if all(len(v) == 0 for v in merged_daily_nav.values()):
-    print("\nNo NAV updates found and no existing history to merge.")
-    print("You may need to adjust from_block or run once without --incremental.")
-    sys.exit(0)
+    anchors = load_inception_anchors(INCEPTION_ANCHOR_FILE)
+    seeded_any = False
+    for feed, cfg in anchors.items():
+        if feed in merged_daily_nav:
+            try:
+                d = pd.to_datetime(cfg["date"]).date()
+                nav = float(cfg["nav"])
+                merged_daily_nav[feed][d] = nav
+                seeded_any = True
+            except Exception:
+                pass
+
+    if seeded_any:
+        print("No fresh updates; seeded dataset from inception anchors.")
+    else:
+        print("\nNo NAV updates found and no existing history to merge.")
+        print("You may need to adjust from_block or run once without --incremental.")
+        sys.exit(0)
+
 
 vault_frames = {}
 for feed in ORACLE_IDS.values():
@@ -662,6 +702,10 @@ with pd.ExcelWriter(OUTPUT_FILENAME, engine="openpyxl") as writer:
 
 print(f"\nSuccessfully exported: {OUTPUT_FILENAME}")
 
+if INCREMENTAL_MODE:
+    save_last_block(latest_block)
+    print(f"Saved last processed block: {latest_block} -> {LAST_BLOCK_FILE}")
+
 print("\n" + "=" * 110)
 print("SUMMARY")
 print("=" * 110)
@@ -688,10 +732,17 @@ for feed in sorted(vault_frames.keys()):
     if len(navs) > 0:
         print(f"  NAV Range: {navs.min():.6f} - {navs.max():.6f}")
 
+    # Backwards-compatible inception column lookup (old/new naming)
+    apy_inc_col = None
+    if "APY Since Inception" in raw_df.columns:
+        apy_inc_col = "APY Since Inception"
+    elif "APY Since Inception (dataset)" in raw_df.columns:
+        apy_inc_col = "APY Since Inception (dataset)"
+
     apy7 = latest_non_null(raw_df["APY 7D"]) if "APY 7D" in raw_df.columns else None
     apy30 = latest_non_null(raw_df["APY 30D"]) if "APY 30D" in raw_df.columns else None
     apy90 = latest_non_null(raw_df["APY 90D"]) if "APY 90D" in raw_df.columns else None
-    apy_inc = latest_non_null(raw_df["APY Since Inception"]) if "APY Since Inception" in raw_df.columns else None
+    apy_inc = latest_non_null(raw_df[apy_inc_col]) if apy_inc_col else None
     sharpe = latest_non_null(raw_df["Sharpe Ratio"]) if "Sharpe Ratio" in raw_df.columns else None
 
     print(f"  Latest APY 7D: {apy7:.3f}%" if apy7 is not None else "  Latest APY 7D: n/a")
@@ -699,6 +750,7 @@ for feed in sorted(vault_frames.keys()):
     print(f"  Latest APY 90D: {apy90:.3f}%" if apy90 is not None else "  Latest APY 90D: n/a")
     print(f"  APY Since Inception: {apy_inc:.3f}%" if apy_inc is not None else "  APY Since Inception: n/a")
     print(f"  Sharpe Ratio: {sharpe:.4f}" if sharpe is not None else "  Sharpe Ratio: n/a")
+
 
 total_elapsed = time.time() - overall_start_ts
 print(f"\nDone. Total runtime: {fmt_seconds(total_elapsed)}")
