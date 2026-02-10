@@ -343,115 +343,90 @@ def load_existing_daily_nav(filename: str, feeds) -> dict:
 
 
 def build_metrics_dataframe(daily_nav: dict, feed_name: str, anchors: dict) -> pd.DataFrame:
+    base_cols = [
+        "Date", "NAV/Share", "Daily % change", "daily_return",
+        "APY 7D", "APY 30D", "APY 90D", "APY Since Inception", "Sharpe Ratio"
+    ]
+
     if not daily_nav:
-        return pd.DataFrame(columns=[
-            "Date", "NAV/Share", "Daily % change", "daily_return",
-            "APY 7D", "APY 30D", "APY 90D", "APY Since Inception", "Sharpe Ratio"
-        ])
+        return pd.DataFrame(columns=base_cols)
 
-    rows = []
-    prev_nav = None
-    for d in sorted(daily_nav.keys()):
-        nav = float(daily_nav[d])
+    # Build base frame from daily NAV map
+    df = pd.DataFrame(
+        [{"Date": d, "NAV/Share": float(v)} for d, v in sorted(daily_nav.items())]
+    )
 
-        if prev_nav is None or prev_nav == 0:
-            daily_pct = None
-            daily_ret = None
-        else:
-            daily_pct = ((nav - prev_nav) / prev_nav) * 100.0
-            daily_ret = daily_pct / 100.0
-
-        rows.append({
-            "Date": d,
-            "NAV/Share": nav,
-            "Daily % change": daily_pct,
-            "daily_return": daily_ret,
-        })
-        prev_nav = nav
-
-    df = pd.DataFrame(rows)
-
-    # rolling APYs
-    for window in (7, 30, 90):
-        col = f"APY {window}D"
-        if len(df) < window:
-            df[col] = pd.NA
-        else:
-            df[col] = (
-                (1 + df["daily_return"])
-                .rolling(window=window, min_periods=window)
-                .apply(lambda x: (x.prod() ** (365.0 / window)) - 1.0, raw=False)
-            ) * 100.0
-
-    # since inception APY (anchor-aware, require >=7 calendar days)
-    inception_apy = pd.NA
-
-    anchor_nav = None
-    anchor_date = None
-
-    if len(df) >= 1:
-        anchor_nav = float(df["NAV/Share"].iloc[0])
-        anchor_date = pd.to_datetime(df["Date"].iloc[0]).date()
-
+    # Hard-trim to anchor date FIRST so all downstream metrics use anchored history
     feed_anchor = anchors.get(feed_name)
     if isinstance(feed_anchor, dict):
         try:
             a_date = pd.to_datetime(feed_anchor.get("date")).date()
-            a_nav = float(feed_anchor.get("nav"))
-
-            # 1) Hard-trim dataset at anchor date so ALL metrics use anchored history
             date_series = pd.to_datetime(df["Date"], errors="coerce").dt.date
             df = df[date_series >= a_date].copy()
             df = df.sort_values("Date").reset_index(drop=True)
-
-            # If trimming removed everything, keep default behaviour
-            if df.empty:
-                anchor_date = None
-                anchor_nav = None
-            else:
-                # 2) Prefer on-dataset NAV at anchor date when available
-                trimmed_dates = pd.to_datetime(df["Date"], errors="coerce").dt.date
-                mask = trimmed_dates == a_date
-                if mask.any():
-                    a_nav = float(df.loc[mask, "NAV/Share"].iloc[-1])
-
-                last_date_tmp = pd.to_datetime(df["Date"].iloc[-1]).date()
-                if a_date <= last_date_tmp and a_nav > 0:
-                    anchor_date = a_date
-                    anchor_nav = a_nav
         except Exception:
             pass
 
-        if df.empty:
-            return pd.DataFrame(columns=[
-                "Date", "NAV/Share", "Daily % change", "daily_return",
-                "APY 7D", "APY 30D", "APY 90D", "APY Since Inception", "Sharpe Ratio"
-            ])
+    if df.empty:
+        return pd.DataFrame(columns=base_cols)
 
+    # Recompute daily return AFTER trimming
+    df["prev_nav"] = df["NAV/Share"].shift(1)
+    df["daily_return"] = (df["NAV/Share"] / df["prev_nav"]) - 1.0
+    df.loc[df["prev_nav"].isna() | (df["prev_nav"] == 0), "daily_return"] = pd.NA
+    df["Daily % change"] = df["daily_return"] * 100.0
+    df = df.drop(columns=["prev_nav"])
 
-    if len(df) >= 2 and anchor_nav is not None and anchor_date is not None:
-        last_nav = float(df["NAV/Share"].iloc[-1])
+    # Rolling APYs
+    for window in (7, 30, 90):
+        col = f"APY {window}D"
+        df[col] = (
+            (1 + df["daily_return"])
+            .rolling(window=window, min_periods=window)
+            .apply(lambda x: (x.prod() ** (365.0 / window)) - 1.0, raw=False)
+        ) * 100.0
+
+    # Since inception APY (anchor-aware)
+    inception_apy = pd.NA
+    if len(df) >= 2:
+        first_date = pd.to_datetime(df["Date"].iloc[0]).date()
+        first_nav = float(df["NAV/Share"].iloc[0])
+
+        # Prefer anchor NAV/date if present and valid
+        if isinstance(feed_anchor, dict):
+            try:
+                a_date = pd.to_datetime(feed_anchor.get("date")).date()
+                a_nav = float(feed_anchor.get("nav"))
+                mask = pd.to_datetime(df["Date"], errors="coerce").dt.date == a_date
+                if mask.any():
+                    a_nav = float(df.loc[mask, "NAV/Share"].iloc[-1])
+                if a_nav > 0:
+                    first_date = a_date
+                    first_nav = a_nav
+            except Exception:
+                pass
+
         last_date = pd.to_datetime(df["Date"].iloc[-1]).date()
-        days_elapsed = (last_date - anchor_date).days
+        last_nav = float(df["NAV/Share"].iloc[-1])
+        days_elapsed = (last_date - first_date).days
 
-        if anchor_nav > 0 and last_nav > 0 and days_elapsed >= 7:
-            total_return = last_nav / anchor_nav
-            inception_apy = (total_return ** (365.0 / days_elapsed) - 1.0) * 100.0
+        if first_nav > 0 and last_nav > 0 and days_elapsed >= 7:
+            inception_apy = ((last_nav / first_nav) ** (365.0 / days_elapsed) - 1.0) * 100.0
 
     df["APY Since Inception"] = inception_apy
 
-    # Sharpe ratio (annualised, rf~0)
+    # Sharpe ratio (annualised, rf ~ 0)
     sharpe = pd.NA
     dr = pd.to_numeric(df["daily_return"], errors="coerce").dropna()
     if len(dr) >= 7:
         std_daily = dr.std()
-        if std_daily and std_daily > 0:
-            mean_daily = dr.mean()
-            sharpe = (mean_daily / std_daily) * (365.0 ** 0.5)
+        if pd.notna(std_daily) and std_daily > 0:
+            sharpe = (dr.mean() / std_daily) * (365.0 ** 0.5)
 
     df["Sharpe Ratio"] = sharpe
 
-    return df
+    return df[base_cols]
+
 
 
 def latest_non_null(series: pd.Series):
