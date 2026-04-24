@@ -10,3 +10,8 @@ dependencies = [
     "python-dotenv",
     "web3",
 ]
+
+[dependency-groups]
+dev = [
+    "pip-audit>=2.10.0",
+]
